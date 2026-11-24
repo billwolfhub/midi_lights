@@ -1,51 +1,128 @@
-// qtpy_midi_lights — USB MIDI -> external NeoPixel/WS2811 strip on an Adafruit QT Py
+// qtpy_midi_lights — USB MIDI -> NeoPixel/WS2811 lights on an Adafruit QT Py RP2040
 //
-// Works on QT Py RP2040 (primary target) and QT Py SAMD21 / ESP32-S2/S3.
-// Arduino IDE: Tools -> USB Stack -> "Adafruit TinyUSB" (RP2040 / SAMD21).
+// Arduino IDE: Board "Adafruit QT Py RP2040", Tools -> USB Stack -> "Adafruit TinyUSB".
 //
-// Wiring (strip):
-//   QT Py A3 -> 330R -> strip DIN (middle wire)
-//   QT Py GND -> strip GND
-//   strip +  -> 5V. While testing on USB only, the QT Py 5V pin is fine with
-//               STRIP_BRIGHTNESS kept low. With the external 5V supply: supply +
-//               to strip +, supply - to strip GND AND QT Py GND. Do not connect
-//               the supply to the QT Py 5V pin while USB is plugged in.
+// OUTPUT PORTS — each is a connector with +5V, data and GND:
+//   port 0 = A3   the 50-lamp strip (comets + strum/kick/snare flashes)
+//   port 1 = A2   rings
+//   port 2 = A1   rings
+//   port 3 = A0   rings
+// Data: pin -> 74AHCT125 (one channel per port) -> 330R -> device DIN.
+// Several rings can be chained on one port (DOUT of one -> DIN of the next);
+// give each its own entry in RINGS[] with the right `first` offset.
+// Unused ports and missing pixels are harmless: data just goes nowhere.
+//
+// Power: on USB only, keep brightness low. With the external 5V supply:
+// supply + to every port's +5V, supply - to every port's GND AND QT Py GND.
+// Never connect the supply to the QT Py 5V pin while USB is plugged in.
 //
 // Onboard NeoPixel = status: blue at boot, then flickers white on MIDI input.
 //
-// Effects:
+// Strip effects (unchanged):
 //   CC 21 / 22 / 3   -> travelling comets; value shifts hue and sets speed
 //   Ch10 note 36/38  -> kick / snare flashes at the strip ends
 //   Ch3 notes        -> strum flashes; pitch sets colour and position
+// Ring effects: see RINGS[] below — each ring flashes on one channel+note.
+//
+// Optional: one or two Adafruit quad 14-segment displays (HT16K33 backpack)
+// on the STEMMA QT port. Left shows the channel ("Ch10" / "cc21"), right
+// shows the note name ("D#1", MIDI Monitor naming: C3 = 60) or CC value.
+// Second display needs its A0 jumper bridged on the back (address 0x71).
+// Libraries: Adafruit LED Backpack, Adafruit GFX, Adafruit BusIO.
 
 #include <Adafruit_TinyUSB.h>
 #include <Adafruit_NeoPixel.h>
 #include <MIDI.h>
+#include <Wire.h>
+#include <Adafruit_LEDBackpack.h>
 
-// ---------- Hardware ----------
-const int     STRIP_PIN        = A3;
-const int     STRIP_PIXELS     = 50;
-const uint8_t STRIP_BRIGHTNESS = 40;    // low for USB power; raise once the 5V supply is in
+// =====================================================================
+// CONFIGURATION — edit this section to match what's plugged in
+// =====================================================================
 
-// Colour order: NEO_GRB if the strip test showed red, green, blue;
-// NEO_BRG if it showed red, blue, green.
-#define STRIP_ORDER NEO_GRB
+// ---- Ports ----
+struct PortConfig {
+  int      pin;
+  int      pixels;      // total pixels on this port (strip length, or all chained rings)
+  neoPixelType order;   // NEO_GRB, NEO_BRG, NEO_GRBW (RGBW rings), ...
+  uint8_t  brightness;  // 0..255
+};
 
-// Software current limit for the strip, in mA. Frames that would draw more
-// are scaled down. ~400 is safe on USB; set near the supply rating minus
-// headroom once on the external supply (e.g. 3500 for a 4A supply).
-const int   MAX_STRIP_MA   = 400;
+PortConfig PORTS[] = {
+  // pin  pixels  order                    brightness
+  {  A3,  50,     NEO_GRB  + NEO_KHZ800,   40 },   // 0: the strip
+  {  A2,  24,     NEO_GRB  + NEO_KHZ800,   40 },   // 1: 24-ring
+  {  A1,  24,     NEO_GRB  + NEO_KHZ800,   40 },   // 2: 24-ring
+  {  A0,  7,      NEO_GRB  + NEO_KHZ800,   40 },   // 3: 7-pixel jewel
+};
+const int NUM_PORTS = sizeof(PORTS) / sizeof(PORTS[0]);
+const int STRIP_PORT = 0;
+
+// ---- Rings: one entry per ring, each triggered by one channel + note ----
+enum RingStyle { FLASH, SPIN };
+
+struct RingConfig {
+  int       port;       // which port it's on
+  int       first;      // first pixel index on that port (0 unless chained)
+  int       count;      // pixels in this ring
+  uint8_t   channel;    // MIDI channel 1..16
+  uint8_t   note;       // MIDI note number (MIDI Monitor's C1 = 36)
+  float     hue;        // 0..1 (0 red, 0.08 orange, 0.16 yellow, 0.33 green, 0.55 cyan, 0.66 blue, 0.8 purple)
+  float     sat;        // 0 white .. 1 full colour
+  float     decayMs;    // fade time after the hit
+  RingStyle style;      // FLASH = whole ring; SPIN = bright arc that runs round as it fades
+};
+
+RingConfig RINGS[] = {
+  // port first count  ch  note  hue    sat   decay  style
+  {  1,   0,    24,    10, 36,   0.05f, 1.0f, 350,   FLASH },  // kick
+  {  2,   0,    24,    10, 38,   0.00f, 0.1f, 250,   SPIN  },  // snare (near-white)
+  {  3,   0,    7,     10, 42,   0.55f, 0.8f, 150,   FLASH },  // closed hi-hat
+};
+const int NUM_RINGS = sizeof(RINGS) / sizeof(RINGS[0]);
+
+// ---- Power ----
+// Software current limit across ALL ports, in mA. Frames that would draw more
+// are scaled down. ~400 on USB; ~3500 for a 4A external supply.
+const int   MAX_TOTAL_MA   = 400;
 const float MA_PER_CHANNEL = 20.0f;     // per colour channel at full value
 const float MA_IDLE        = 1.0f;      // per pixel, chips switched on
 
-Adafruit_NeoPixel strip(STRIP_PIXELS, STRIP_PIN, STRIP_ORDER + NEO_KHZ800);
+// ---- 14-segment displays ----
+// STEMMA QT connector on the QT Py RP2040 = Wire1. If you wire the displays
+// to the SDA/SCL header pins instead, change this to &Wire.
+TwoWire* const DISPLAY_BUS   = &Wire1;  // STEMMA QT connector (use &Wire for the header SDA/SCL pins)
+const uint8_t  DISPLAY_LEFT  = 0x70;   // default address
+const uint8_t  DISPLAY_RIGHT = 0x71;   // A0 jumper bridged
+const uint8_t  DISPLAY_BRIGHTNESS = 8; // 0..15
+const unsigned long DISPLAY_MS = 50;   // max ~20 updates/sec
+const bool     SHOW_NOTE_OFFS = false; // true to show note-offs too
+
+// Display style:
+//   DISPLAY_TEXT  = channel + note name ("Ch10" "D#1")
+//   DISPLAY_ALIEN = every note has its own made-up glyph; hits scroll in
+//                   from the right like an alien script being written.
+enum DisplayStyle { DISPLAY_TEXT, DISPLAY_ALIEN };
+const DisplayStyle DISPLAY_STYLE = DISPLAY_ALIEN;
+const bool     ALIEN_IDLE_CHATTER = true;   // glyphs murmur quietly when idle
+const unsigned long ALIEN_IDLE_MS = 4000;   // idle time before chatter starts
+
+// =====================================================================
+
+const int MAX_PORT_PIXELS = 64;   // buffer size per port
+
+Adafruit_NeoPixel* ports[NUM_PORTS];
+float rBuf[NUM_PORTS][MAX_PORT_PIXELS];
+float gBuf[NUM_PORTS][MAX_PORT_PIXELS];
+float bBuf[NUM_PORTS][MAX_PORT_PIXELS];
+float wBuf[NUM_PORTS][MAX_PORT_PIXELS];   // white channel for RGBW rings
 
 #if defined(PIN_NEOPIXEL)
 Adafruit_NeoPixel status(1, PIN_NEOPIXEL, NEO_GRB + NEO_KHZ800);
 #define HAS_STATUS 1
 #endif
 
-// ---------- Timing / look ----------
+// ---------- Strip timing / look ----------
 const float FADE_MS        = 1500.0f;
 const int   IDLE_TIMEOUT   = 100;
 const float COMET_TAIL     = 0.4f;   // fraction of the strip length
@@ -111,7 +188,163 @@ struct NoteFlash {
 const int MAX_FLASHES = 12;
 NoteFlash flashes[MAX_FLASHES];
 
+struct RingState {
+  float brightness;   // 0..1, decays after a hit
+  float angle;        // 0..1, for SPIN
+};
+RingState ringState[NUM_RINGS];
+
 unsigned long lastMidiMs = 0;   // for the status pixel
+
+// ---------- Displays ----------
+Adafruit_AlphaNum4 dispLeft, dispRight;
+bool hasLeft = false, hasRight = false;
+
+struct DisplayEvent {
+  bool    pending;
+  bool    isCC;
+  uint8_t channel;
+  uint8_t number;   // note or CC number
+  uint8_t value;    // velocity or CC value
+};
+DisplayEvent dispEvent = { false, false, 0, 0, 0 };
+
+// ---- Alien script ----
+// Segment bits (Adafruit layout): A0 B1 C2 D3 E4 F5 G1 6 G2 7 H8 J9 K10 L11 M12 N13
+// Glyphs are left/right mirror-symmetric, which makes them read like a script.
+const uint16_t SEG_A = 1<<0, SEG_D = 1<<3, SEG_J = 1<<9, SEG_M = 1<<12;
+struct SegPair { uint16_t left, right; };
+const SegPair MIRROR[] = {
+  { 1<<5,  1<<1  },   // F  | B   upper verticals
+  { 1<<4,  1<<2  },   // E  | C   lower verticals
+  { 1<<6,  1<<7  },   // G1 | G2  middle bars
+  { 1<<8,  1<<10 },   // H  | K   upper diagonals
+  { 1<<11, 1<<13 },   // L  | N   lower diagonals
+};
+
+uint32_t hash32(uint32_t x) {
+  x ^= x >> 16; x *= 0x7feb352d; x ^= x >> 15; x *= 0x846ca68b; x ^= x >> 16;
+  return x;
+}
+
+// Same input always gives the same glyph, so each note has a fixed "letter".
+uint16_t alienGlyph(uint32_t seed) {
+  for (uint32_t salt = 0; ; salt++) {
+    uint32_t h = hash32(seed * 2654435761u + salt * 97u + 12345u);
+    uint16_t g = 0;
+    for (int i = 0; i < 5; i++)
+      if (h & (1u << i)) g |= MIRROR[i].left | MIRROR[i].right;
+    if (h & (1u << 5)) g |= SEG_A;
+    if (h & (1u << 6)) g |= SEG_D;
+    if (h & (1u << 7)) g |= SEG_J;
+    if (h & (1u << 8)) g |= SEG_M;
+    int bits = __builtin_popcount(g);
+    // keep it legible: not too sparse, not a solid block, and not a real letter-ish 8
+    if (bits >= 4 && bits <= 9) return g;
+  }
+}
+
+uint16_t alienLine[8];          // what's on the two displays, left to right
+uint16_t alienQueue[8];         // glyphs waiting to scroll in
+int      alienQueued = 0;
+unsigned long lastAlienInput = 0;
+
+void noteDisplay(bool isCC, uint8_t channel, uint8_t number, uint8_t value) {
+  if (DISPLAY_STYLE == DISPLAY_ALIEN) {
+    if (isCC || value == 0) return;            // notes only
+    if (alienQueued < 8) alienQueue[alienQueued++] = alienGlyph(channel * 128u + number);
+    lastAlienInput = millis();
+    return;
+  }
+  dispEvent = { true, isCC, channel, number, value };   // latest wins
+}
+
+void drawAlien() {
+  int width = (hasLeft && hasRight) ? 8 : 4;
+  int offset = 8 - width;                      // show the newest glyphs
+  Adafruit_AlphaNum4 *a = hasLeft ? &dispLeft : &dispRight;
+  for (int i = 0; i < width; i++) {
+    Adafruit_AlphaNum4 *d = (width == 8 && i >= 4) ? &dispRight : a;
+    d->writeDigitRaw(i % 4, alienLine[offset + i]);
+  }
+  if (hasLeft)  dispLeft.writeDisplay();
+  if (hasRight) dispRight.writeDisplay();
+}
+
+void updateAlien(unsigned long now) {
+  static unsigned long lastDraw = 0, lastChatter = 0;
+  if (now - lastDraw < DISPLAY_MS) return;
+
+  if (alienQueued > 0) {
+    // scroll everything left and append the queued glyphs
+    int n = alienQueued;
+    for (int i = 0; i < 8; i++) alienLine[i] = (i + n < 8) ? alienLine[i + n] : alienQueue[i + n - 8];
+    alienQueued = 0;
+    lastDraw = now;
+    drawAlien();
+    return;
+  }
+
+  // idle chatter: now and then one glyph mutates, or the line fades a glyph out
+  if (ALIEN_IDLE_CHATTER && now - lastAlienInput > ALIEN_IDLE_MS && now - lastChatter > 700) {
+    lastChatter = now;
+    uint32_t r = hash32(now);
+    int pos = r % 8;
+    if ((r >> 8) % 3 == 0) alienLine[pos] = 0;
+    else                   alienLine[pos] = alienGlyph(r >> 4);
+    lastDraw = now;
+    drawAlien();
+  }
+}
+
+void writeText(Adafruit_AlphaNum4 &d, const char *t) {
+  for (int i = 0; i < 4; i++) d.writeDigitAscii(i, t[i] ? t[i] : ' ');
+  d.writeDisplay();
+}
+
+// MIDI Monitor / DrumStrum naming: C3 = note 60, so octave = n/12 - 2.
+void noteName(uint8_t n, char *out) {
+  static const char *names[] = { "C ", "C#", "D ", "D#", "E ", "F ",
+                                 "F#", "G ", "G#", "A ", "A#", "B " };
+  int oct = n / 12 - 2;
+  const char *nm = names[n % 12];
+  if (oct < 0) snprintf(out, 5, "%c%c-%d", nm[0], nm[1], -oct);
+  else         snprintf(out, 5, "%c%c%d ", nm[0], nm[1], oct);
+}
+
+void updateDisplays(unsigned long now) {
+  static unsigned long lastDraw = 0;
+  if (!hasLeft && !hasRight) return;
+  if (DISPLAY_STYLE == DISPLAY_ALIEN) { updateAlien(now); return; }
+  if (!dispEvent.pending || (!hasLeft && !hasRight)) return;
+  if (now - lastDraw < DISPLAY_MS) return;
+  lastDraw = now;
+  DisplayEvent e = dispEvent;
+  dispEvent.pending = false;
+
+  char left[6], right[6];
+  if (e.isCC) {
+    snprintf(left,  sizeof(left),  "cc%2d", e.number % 100);
+    snprintf(right, sizeof(right), "%4d", e.value);
+  } else {
+    snprintf(left,  sizeof(left),  "Ch%2d", e.channel);
+    noteName(e.number, right);
+  }
+
+  if (hasLeft && hasRight) {
+    writeText(dispLeft, left);
+    writeText(dispRight, right);
+  } else {
+    // one display: channel + compact note, e.g. "3D#1", "10C1"; CC: "2187"
+    char one[12], compact[6]; int k = 0;
+    for (int i = 0; right[i] && k < 5; i++) if (right[i] != ' ') compact[k++] = right[i];
+    compact[k] = 0;
+    if (e.isCC) snprintf(one, sizeof(one), "%2d%2d", e.number % 100, e.value % 100);
+    else        snprintf(one, sizeof(one), "%d%s", e.channel, compact);
+    one[4] = 0;
+    writeText(hasLeft ? dispLeft : dispRight, one);
+  }
+}
 
 // ---------- Helpers ----------
 float wrapf(float v) {
@@ -122,6 +355,11 @@ float wrapf(float v) {
 
 float clampf(float v, float lo, float hi) {
   return v < lo ? lo : (v > hi ? hi : v);
+}
+
+bool isRGBW(neoPixelType t) {
+  // Adafruit encodes RGBW orders with the white offset differing from red's.
+  return ((t >> 6) & 0b11) != ((t >> 4) & 0b11);
 }
 
 // HSV (0..1) -> RGB (0..255 floats)
@@ -144,6 +382,21 @@ void hsvToRgb(float h, float s, float v, float &r, float &g, float &b) {
   r *= 255; g *= 255; b *= 255;
 }
 
+// Add a colour into a port buffer. On RGBW ports, the white-ish part goes to W.
+void addPixel(int port, int p, float h, float s, float v) {
+  if (p < 0 || p >= PORTS[port].pixels || p >= MAX_PORT_PIXELS) return;
+  float r, g, b;
+  if (isRGBW(PORTS[port].order) && s < 0.5f) {
+    // low saturation: use the dedicated white LED plus a tint
+    float tint = s / 0.5f;
+    hsvToRgb(h, 1.0f, v * tint, r, g, b);
+    wBuf[port][p] += v * (1.0f - tint) * 255;
+  } else {
+    hsvToRgb(h, s, v, r, g, b);
+  }
+  rBuf[port][p] += r; gBuf[port][p] += g; bBuf[port][p] += b;
+}
+
 // Reuse a flash already playing this channel+note, else a free one, else the dimmest.
 NoteFlash* allocFlash(uint8_t channel, uint8_t note) {
   for (int i = 0; i < MAX_FLASHES; i++)
@@ -162,6 +415,7 @@ void onNoteOff(byte channel, byte note, byte velocity);
 
 void onControlChange(byte channel, byte cc, byte value) {
   lastMidiMs = millis();
+  noteDisplay(true, channel, cc, value);
   for (int i = 0; i < NUM_CHANNELS; i++) {
     if (channels[i].cc == cc) {
       float norm = value / 127.0f;
@@ -175,11 +429,24 @@ void onControlChange(byte channel, byte cc, byte value) {
   }
 }
 
+void triggerRings(byte channel, byte note, byte velocity) {
+  float norm = velocity / 127.0f;
+  for (int i = 0; i < NUM_RINGS; i++) {
+    if (RINGS[i].channel == channel && RINGS[i].note == note) {
+      ringState[i].brightness = 0.35f + norm * 0.65f;
+      ringState[i].angle      = 0;
+    }
+  }
+}
+
 void onNoteOn(byte channel, byte note, byte velocity) {
   lastMidiMs = millis();
-  if (channel != DRUM_CHANNEL && channel != STRUM_CHANNEL) return;
   if (velocity == 0) { onNoteOff(channel, note, 0); return; }
+  noteDisplay(false, channel, note, velocity);
 
+  triggerRings(channel, note, velocity);
+
+  if (channel != DRUM_CHANNEL && channel != STRUM_CHANNEL) return;
   float norm = velocity / 127.0f;
 
   float hue, sat, bright, decay, pos;
@@ -196,7 +463,7 @@ void onNoteOn(byte channel, byte note, byte velocity) {
     decay = 1.0f / (STRUM_DECAY_MS / 1000.0f);
     pos = POS_STRUM_LO + span * (POS_STRUM_HI - POS_STRUM_LO);
   } else {
-    return;   // other drum notes: ignored for now
+    return;   // other drum notes: rings only
   }
 
   NoteFlash* f = allocFlash(channel, note);
@@ -206,9 +473,11 @@ void onNoteOn(byte channel, byte note, byte velocity) {
   f->holding = true; f->active = true;
 }
 
-// Release only the flash for this channel+note.
+// Release only the strip flash for this channel+note. Rings ignore note-off:
+// drum hits are short, so rings always fade from the moment of the hit.
 void onNoteOff(byte channel, byte note, byte velocity) {
   lastMidiMs = millis();
+  if (SHOW_NOTE_OFFS) noteDisplay(false, channel, note, 0);
   for (int i = 0; i < MAX_FLASHES; i++) {
     if (flashes[i].active && flashes[i].holding &&
         flashes[i].channel == channel && flashes[i].note == note)
@@ -235,14 +504,19 @@ void updateState(unsigned long now, float dt) {
     if (!f.holding) f.brightness -= f.decayRate * dt;
     if (f.brightness <= 0) f.active = false;
   }
+
+  for (int i = 0; i < NUM_RINGS; i++) {
+    RingState &s = ringState[i];
+    if (s.brightness <= 0) continue;
+    s.brightness -= dt / (RINGS[i].decayMs / 1000.0f);
+    if (s.brightness < 0) s.brightness = 0;
+    s.angle = wrapf(s.angle + dt * 2.0f);   // SPIN: ~2 turns per second
+  }
 }
 
-float rBuf[STRIP_PIXELS], gBuf[STRIP_PIXELS], bBuf[STRIP_PIXELS];
-
-void render() {
-  const int n = STRIP_PIXELS;
-  float cr, cg, cb;
-  for (int p = 0; p < n; p++) rBuf[p] = gBuf[p] = bBuf[p] = 0;
+void renderStrip() {
+  const int port = STRIP_PORT;
+  const int n = PORTS[port].pixels;
 
   // CC comet layer
   for (int i = 0; i < NUM_CHANNELS; i++) {
@@ -253,8 +527,7 @@ void render() {
       if (dist >= COMET_TAIL) continue;
       float comet = 1.0f - (dist / COMET_TAIL);
       comet *= comet;
-      hsvToRgb(ch.targetHue, 1.0f, comet * ch.brightness, cr, cg, cb);
-      rBuf[p] += cr; gBuf[p] += cg; bBuf[p] += cb;
+      addPixel(port, p, ch.targetHue, 1.0f, comet * ch.brightness);
     }
   }
 
@@ -265,34 +538,63 @@ void render() {
     int center = (int)(f.pos * n + 0.5f);
     if (center >= n) center = n - 1;
     for (int k = -1; k <= 1; k++) {
-      int p = center + k;
-      if (p < 0 || p >= n) continue;
       float weight = (k == 0) ? 1.0f : 0.35f;
-      hsvToRgb(f.hue, f.sat, f.brightness * weight, cr, cg, cb);
-      rBuf[p] += cr; gBuf[p] += cg; bBuf[p] += cb;
+      addPixel(port, center + k, f.hue, f.sat, f.brightness * weight);
     }
   }
+}
 
-  // Clamp, estimate current, scale down if over budget
-  float total = 0;
-  for (int p = 0; p < n; p++) {
-    rBuf[p] = min(rBuf[p], 255.0f);
-    gBuf[p] = min(gBuf[p], 255.0f);
-    bBuf[p] = min(bBuf[p], 255.0f);
-    total += rBuf[p] + gBuf[p] + bBuf[p];
+void renderRings() {
+  for (int i = 0; i < NUM_RINGS; i++) {
+    const RingConfig &rc = RINGS[i];
+    const RingState  &s  = ringState[i];
+    if (s.brightness <= 0) continue;
+    for (int k = 0; k < rc.count; k++) {
+      float v = s.brightness;
+      if (rc.style == SPIN) {
+        float dist = wrapf(k / (float)rc.count - s.angle);
+        float arc  = (dist < 0.35f) ? 1.0f - dist / 0.35f : 0.0f;
+        v *= 0.15f + 0.85f * arc * arc;   // dim ring with a bright running arc
+      }
+      addPixel(rc.port, rc.first + k, rc.hue, rc.sat, v);
+    }
   }
-  float estMa = total / 255.0f * MA_PER_CHANNEL * (STRIP_BRIGHTNESS / 255.0f)
-              + MA_IDLE * n;
+}
+
+// Clamp all buffers, apply the global current limit, push to the pixels.
+void flush() {
+  float estMa = 0, idleMa = 0;
+  for (int pt = 0; pt < NUM_PORTS; pt++) {
+    int n = min(PORTS[pt].pixels, MAX_PORT_PIXELS);
+    float bscale = PORTS[pt].brightness / 255.0f;
+    float sum = 0;
+    for (int p = 0; p < n; p++) {
+      rBuf[pt][p] = min(rBuf[pt][p], 255.0f);
+      gBuf[pt][p] = min(gBuf[pt][p], 255.0f);
+      bBuf[pt][p] = min(bBuf[pt][p], 255.0f);
+      wBuf[pt][p] = min(wBuf[pt][p], 255.0f);
+      sum += rBuf[pt][p] + gBuf[pt][p] + bBuf[pt][p] + wBuf[pt][p];
+    }
+    estMa  += sum / 255.0f * MA_PER_CHANNEL * bscale;
+    idleMa += MA_IDLE * n;
+  }
+  estMa += idleMa;
+
   float scale = 1.0f;
-  if (estMa > MAX_STRIP_MA) scale = (MAX_STRIP_MA - MA_IDLE * n) / (estMa - MA_IDLE * n);
+  if (estMa > MAX_TOTAL_MA && estMa > idleMa)
+    scale = max(0.0f, (MAX_TOTAL_MA - idleMa) / (estMa - idleMa));
 
-  for (int p = 0; p < n; p++) {
-    strip.setPixelColor(p,
-      (uint8_t)(rBuf[p] * scale),
-      (uint8_t)(gBuf[p] * scale),
-      (uint8_t)(bBuf[p] * scale));
+  for (int pt = 0; pt < NUM_PORTS; pt++) {
+    int n = min(PORTS[pt].pixels, MAX_PORT_PIXELS);
+    bool rgbw = isRGBW(PORTS[pt].order);
+    for (int p = 0; p < n; p++) {
+      uint8_t r = rBuf[pt][p] * scale, g = gBuf[pt][p] * scale, b = bBuf[pt][p] * scale;
+      if (rgbw) ports[pt]->setPixelColor(p, r, g, b, (uint8_t)(wBuf[pt][p] * scale));
+      else      ports[pt]->setPixelColor(p, r, g, b);
+      rBuf[pt][p] = gBuf[pt][p] = bBuf[pt][p] = wBuf[pt][p] = 0;
+    }
+    ports[pt]->show();
   }
-  strip.show();
 }
 
 void updateStatus(unsigned long now) {
@@ -304,21 +606,23 @@ void updateStatus(unsigned long now) {
 #endif
 }
 
-// Boot self-test: one red, green, blue sweep down the strip, so wiring and
-// colour order can be checked without sending any MIDI.
+// Boot self-test: a red, green, blue dot runs along every port at once,
+// so wiring and colour order can be checked without sending any MIDI.
 void selfTest() {
-  uint32_t colors[] = { strip.Color(255, 0, 0), strip.Color(0, 255, 0), strip.Color(0, 0, 255) };
+  uint32_t colors[] = { 0xFF0000, 0x00FF00, 0x0000FF };
+  int longest = 0;
+  for (int pt = 0; pt < NUM_PORTS; pt++) longest = max(longest, PORTS[pt].pixels);
   for (int c = 0; c < 3; c++) {
-    for (int p = 0; p < STRIP_PIXELS; p++) {
-      strip.clear();
-      strip.setPixelColor(p, colors[c]);
-      if (p > 0) strip.setPixelColor(p - 1, colors[c] & 0x3F3F3F);
-      strip.show();
+    for (int p = 0; p < longest; p++) {
+      for (int pt = 0; pt < NUM_PORTS; pt++) {
+        ports[pt]->clear();
+        if (p < PORTS[pt].pixels) ports[pt]->setPixelColor(p, colors[c]);
+        ports[pt]->show();
+      }
       delay(8);
     }
   }
-  strip.clear();
-  strip.show();
+  for (int pt = 0; pt < NUM_PORTS; pt++) { ports[pt]->clear(); ports[pt]->show(); }
 }
 
 // ---------- Setup / loop ----------
@@ -337,12 +641,26 @@ void setup() {
   status.show();
 #endif
 
-  strip.begin();
-  strip.setBrightness(STRIP_BRIGHTNESS);
-  strip.clear();
-  strip.show();
+  for (int pt = 0; pt < NUM_PORTS; pt++) {
+    ports[pt] = new Adafruit_NeoPixel(PORTS[pt].pixels, PORTS[pt].pin, PORTS[pt].order);
+    ports[pt]->begin();
+    ports[pt]->setBrightness(PORTS[pt].brightness);
+    ports[pt]->clear();
+    ports[pt]->show();
+  }
 
   Serial.begin(115200);
+
+  DISPLAY_BUS->begin();
+  hasLeft  = dispLeft.begin(DISPLAY_LEFT, DISPLAY_BUS);
+  hasRight = dispRight.begin(DISPLAY_RIGHT, DISPLAY_BUS);
+  if (hasLeft)  { dispLeft.setBrightness(DISPLAY_BRIGHTNESS);  writeText(dispLeft,  "MIDI"); }
+  if (hasRight) { dispRight.setBrightness(DISPLAY_BRIGHTNESS); writeText(dispRight, "LITE"); }
+  if (DISPLAY_STYLE == DISPLAY_ALIEN && (hasLeft || hasRight)) {
+    delay(600);
+    for (int i = 0; i < 8; i++) alienLine[i] = alienGlyph(1000 + i);   // greeting
+    drawAlien();
+  }
 
   usb_midi.setStringDescriptor("QT Py MIDI Lights");
   usb_midi.begin();
@@ -372,6 +690,7 @@ void loop() {
 
   unsigned long now = millis();
   updateStatus(now);
+  updateDisplays(now);
 
   static unsigned long lastFrame = 0;
   if (now - lastFrame < FRAME_MS) return;
@@ -379,5 +698,7 @@ void loop() {
   lastFrame = now;
 
   updateState(now, dt);
-  render();
+  renderStrip();
+  renderRings();
+  flush();
 }
