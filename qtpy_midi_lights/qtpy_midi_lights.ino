@@ -84,6 +84,18 @@ const bool  AFTERTOUCH_ON     = true;   // poly + channel pressure shape held no
 const float AT_MIN_LEVEL      = 0.25f;  // brightness at the lightest pressure
 const float AT_SPEED_BOOST    = 1.5f;   // chase/spin speed multiplier added at full pressure
 
+// Velocity-driven colour (rings)
+const float VEL_HUE_SHIFT   = 0.05f;  // harder hits push the hue this far (red -> crimson/magenta, green -> yellow-green)
+const float VEL_WHITE_FLASH = 0.6f;   // harder hits start whiter ("white-hot"), colour returns as it fades
+const float VEL_SPEED_MIN   = 0.6f;   // chase/spin speed at the softest hit...
+const float VEL_SPEED_MAX   = 1.4f;   // ...and at the hardest (x the base speed)
+const float ARC_HUE_SPREAD  = 0.05f;  // colour drift from the head to the tail of each chase arc
+
+// Stuck-note safety and debugging
+const unsigned long MAX_HOLD_MS = 4000;  // held notes auto-release after this (0 = never)
+const bool  DEBUG_MIDI        = false;   // true: print every incoming MIDI message to
+                                         // the Serial Monitor (115200) to trace stuck notes
+
 struct RingConfig {
   int       port;       // which port it's on
   int       first;      // first pixel index on that port (0 unless chained)
@@ -242,6 +254,7 @@ struct NoteFlash {
   bool    holding;
   bool    sustained;  // note released while the sustain pedal was down
   float   baseLevel;  // brightness from velocity, for aftertouch to work from
+  unsigned long startMs;  // when the note started, for MAX_HOLD_MS
 };
 
 const int MAX_FLASHES = 12;
@@ -254,6 +267,9 @@ struct RingState {
   float pressure;     // 0..1 aftertouch, or -1 if none received
   bool  held;         // note still down (or sustained)
   bool  sustained;    // released while the sustain pedal was down
+  unsigned long startMs;  // when the note started, for MAX_HOLD_MS
+  float vel;          // 0..1 velocity of the hit
+  float hue;          // hue for this hit, shifted by velocity
 };
 RingState ringState[NUM_RINGS];
 
@@ -590,11 +606,15 @@ NoteFlash* allocFlash(uint8_t channel, uint8_t note) {
 
 // ---------- MIDI handlers ----------
 void onNoteOff(byte channel, byte note, byte velocity);
+void allNotesOff(uint8_t channel);
+void midiLog(const char *kind, byte ch, int a, int b);
 void setSustain(uint8_t channel, bool down);
 
 void onControlChange(byte channel, byte cc, byte value) {
   lastMidiMs = millis();
+  midiLog("CC  ", channel, cc, value);
   noteDisplay(true, channel, cc, value);
+  if (cc == 120 || cc == 123) { allNotesOff(channel); return; }
   if (cc == SUSTAIN_CC && channel <= 16) { setSustain(channel, value >= 64); return; }
   if (channel != STRIP_CHANNEL) return;          // comets listen on the strip channel only
   for (int i = 0; i < NUM_CHANNELS; i++) {
@@ -608,6 +628,25 @@ void onControlChange(byte channel, byte cc, byte value) {
       channels[i].active      = true;
     }
   }
+}
+
+void midiLog(const char *kind, byte ch, int a, int b) {
+  if (!DEBUG_MIDI) return;
+  Serial.print(millis()); Serial.print("  "); Serial.print(kind);
+  Serial.print(" ch"); Serial.print(ch);
+  if (a >= 0) { Serial.print(" "); Serial.print(a); }
+  if (b >= 0) { Serial.print(" "); Serial.print(b); }
+  Serial.println();
+}
+
+// All Notes Off (CC 123) / All Sound Off (CC 120): release everything held
+// on that channel, including anything the sustain pedal is holding.
+void allNotesOff(uint8_t channel) {
+  if (channel <= 16) sustainDown[channel] = false;
+  for (int i = 0; i < NUM_RINGS; i++)
+    if (RINGS[i].channel == channel) { ringState[i].held = false; ringState[i].sustained = false; }
+  for (int i = 0; i < MAX_FLASHES; i++)
+    if (flashes[i].active && flashes[i].channel == channel) { flashes[i].holding = false; flashes[i].sustained = false; }
 }
 
 // Sustain pedal: while down, note-offs only mark notes as sustained; on
@@ -634,6 +673,7 @@ float pressureLevel(float base, float pressure) {
 // Poly aftertouch: pressure for one held note.
 void onAfterTouchPoly(byte channel, byte note, byte pressure) {
   lastMidiMs = millis();
+  midiLog("PAT ", channel, note, pressure);
   if (!AFTERTOUCH_ON) return;
   float p = pressure / 127.0f;
   for (int i = 0; i < NUM_RINGS; i++)
@@ -647,6 +687,7 @@ void onAfterTouchPoly(byte channel, byte note, byte pressure) {
 // Channel pressure: applies to every held note on the channel.
 void onAfterTouchChannel(byte channel, byte pressure) {
   lastMidiMs = millis();
+  midiLog("CAT ", channel, pressure, -1);
   if (!AFTERTOUCH_ON) return;
   float p = pressure / 127.0f;
   for (int i = 0; i < NUM_RINGS; i++)
@@ -667,12 +708,16 @@ void triggerRings(byte channel, byte note, byte velocity) {
       ringState[i].pressure   = -1;
       ringState[i].held       = HOLD_WHILE_HELD;
       ringState[i].sustained  = false;
+      ringState[i].startMs    = millis();
+      ringState[i].vel        = norm;
+      ringState[i].hue        = wrapf(RINGS[i].hue - VEL_HUE_SHIFT * norm);
     }
   }
 }
 
 void onNoteOn(byte channel, byte note, byte velocity) {
   lastMidiMs = millis();
+  midiLog(velocity ? "ON  " : "ON0 ", channel, note, velocity);
   if (velocity == 0) { onNoteOff(channel, note, 0); return; }
   noteDisplay(false, channel, note, velocity);
 
@@ -704,12 +749,15 @@ void onNoteOn(byte channel, byte note, byte velocity) {
   f->channel = channel; f->note = note;
   f->holding = true; f->active = true;
   f->sustained = false; f->baseLevel = bright;
+  f->startMs = millis();
 }
 
 // Release the strip flash and rings for this channel+note (or mark them
 // sustained if the pedal is down). Rings fade from release.
 void onNoteOff(byte channel, byte note, byte velocity) {
   lastMidiMs = millis();
+  if (velocity) midiLog("OFF ", channel, note, velocity);
+  else if (DEBUG_MIDI) midiLog("OFF ", channel, note, -1);
   if (SHOW_NOTE_OFFS) noteDisplay(false, channel, note, 0);
   if (DISPLAY_STYLE == DISPLAY_ALIEN) alienNoteOff(channel);
   bool sus = (channel <= 16) && sustainDown[channel];
@@ -744,12 +792,17 @@ void updateState(unsigned long now, float dt) {
   for (int i = 0; i < MAX_FLASHES; i++) {
     NoteFlash &f = flashes[i];
     if (!f.active) continue;
+    if (f.holding && MAX_HOLD_MS && now - f.startMs > MAX_HOLD_MS) { f.holding = false; f.sustained = false; }
     if (!f.holding) f.brightness -= f.decayRate * dt;
     if (f.brightness <= 0) f.active = false;
   }
 
   for (int i = 0; i < NUM_RINGS; i++) {
     RingState &s = ringState[i];
+    if (s.held && MAX_HOLD_MS && now - s.startMs > MAX_HOLD_MS) {
+      s.held = false; s.sustained = false;                 // safety: auto-release
+      if (DEBUG_MIDI) { Serial.print("auto-release ring "); Serial.println(i); }
+    }
     if (s.held) {
       s.brightness = pressureLevel(s.baseLevel, s.pressure);   // hold, shaped by aftertouch
     } else {
@@ -758,6 +811,7 @@ void updateState(unsigned long now, float dt) {
       if (s.brightness < 0) s.brightness = 0;
     }
     float turns = (RINGS[i].style == CHASE) ? CHASE_TURNS_PER_SEC : 2.0f;   // SPIN: ~2 turns/s
+    turns *= VEL_SPEED_MIN + (VEL_SPEED_MAX - VEL_SPEED_MIN) * s.vel;
     if (s.held && s.pressure > 0) turns *= 1.0f + AT_SPEED_BOOST * s.pressure;
     s.angle = wrapf(s.angle + dt * turns);
   }
@@ -798,8 +852,12 @@ void renderRings() {
     const RingConfig &rc = RINGS[i];
     const RingState  &s  = ringState[i];
     if (s.brightness <= 0) continue;
+    // white-hot attack: hard hits start desaturated and regain colour as they fade
+    float life  = (s.baseLevel > 0) ? clampf(s.brightness / s.baseLevel, 0.0f, 1.0f) : 0.0f;
+    float sat   = rc.sat * (1.0f - VEL_WHITE_FLASH * s.vel * s.vel * life);
     for (int k = 0; k < rc.count; k++) {
       float v = s.brightness;
+      float h = s.hue;
       if (rc.style == SPIN) {
         float dist = wrapf(k / (float)rc.count - s.angle);
         float arc  = (dist < 0.35f) ? 1.0f - dist / 0.35f : 0.0f;
@@ -809,8 +867,9 @@ void renderRings() {
         float m    = wrapf(dist * CHASE_ARMS);          // position within one arm
         float arc  = (m < CHASE_ARC) ? 1.0f - m / CHASE_ARC : 0.0f;
         v *= arc * arc;                                 // dark between the arcs
+        h = wrapf(h - ARC_HUE_SPREAD * (m / CHASE_ARC)); // tail drifts in colour (away from orange)
       }
-      addPixel(rc.port, rc.first + k, rc.hue, rc.sat, v);
+      addPixel(rc.port, rc.first + k, h, sat, v);
     }
   }
 }
@@ -884,6 +943,12 @@ void setup() {
   // Cores without built-in TinyUSB support need manual init.
   if (!TinyUSBDevice.isInitialized()) TinyUSBDevice.begin(0);
 
+  // Add the MIDI interface first thing, before the Mac finishes enumerating,
+  // so the very first connection already includes MIDI. This avoids a
+  // "serial-only, then MIDI" double connection after a reset.
+  usb_midi.setStringDescriptor("QT Py MIDI Lights");
+  usb_midi.begin();
+
 #ifdef HAS_STATUS
 #if defined(NEOPIXEL_POWER)
   pinMode(NEOPIXEL_POWER, OUTPUT);
@@ -918,8 +983,6 @@ void setup() {
     if (alienDisplays() == 2) drawAlien(1);
   }
 
-  usb_midi.setStringDescriptor("QT Py MIDI Lights");
-  usb_midi.begin();
   MIDI.begin(MIDI_CHANNEL_OMNI);
   MIDI.turnThruOff();
   MIDI.setHandleControlChange(onControlChange);
@@ -928,10 +991,11 @@ void setup() {
   MIDI.setHandleAfterTouchPoly(onAfterTouchPoly);
   MIDI.setHandleAfterTouchChannel(onAfterTouchChannel);
 
-  // Re-enumerate so the MIDI interface shows up if the core started USB already.
+  // Only if the Mac had already enumerated us before the MIDI interface was
+  // added (rare now that it's added first): reconnect so MIDI appears.
   if (TinyUSBDevice.mounted()) {
     TinyUSBDevice.detach();
-    delay(10);
+    delay(1000);
     TinyUSBDevice.attach();
   }
 
