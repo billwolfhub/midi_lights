@@ -40,6 +40,14 @@
 // CONFIGURATION — edit this section to match what's plugged in
 // =====================================================================
 
+// ---- MIDI channels (one per lighting category) ----
+//   ch 1  STRIP      CC 21/22/3 comets + pitched note flashes along the strip
+//   ch 2  DISPLAYS   alien glyphs, held-note brightness, ALL-chord message
+//   ch 3  PERCUSSIVE one-shot hits: rings (RINGS[] table) + strip kick/snare
+const uint8_t STRIP_CHANNEL      = 1;
+const uint8_t DISPLAY_CHANNEL    = 2;
+const uint8_t PERCUSSIVE_CHANNEL = 3;
+
 // ---- Ports ----
 struct PortConfig {
   int      pin;
@@ -51,15 +59,30 @@ struct PortConfig {
 PortConfig PORTS[] = {
   // pin  pixels  order                    brightness
   {  A3,  50,     NEO_GRB  + NEO_KHZ800,   40 },   // 0: the strip
-  {  A2,  24,     NEO_GRB  + NEO_KHZ800,   40 },   // 1: 24-ring
-  {  A1,  24,     NEO_GRB  + NEO_KHZ800,   40 },   // 2: 24-ring
-  {  A0,  7,      NEO_GRB  + NEO_KHZ800,   40 },   // 3: 7-pixel jewel
+  {  A2,  24,     NEO_GRB  + NEO_KHZ800,   80 },   // 1: 24-ring
+  {  A1,  144,    NEO_GRB  + NEO_KHZ800,   80 },   // 2: six 24-rings chained (DOUT -> next ring's DIN)
+  {  A0,  7,      NEO_GRB  + NEO_KHZ800,   80 },   // 3: 7-pixel jewel
 };
 const int NUM_PORTS = sizeof(PORTS) / sizeof(PORTS[0]);
 const int STRIP_PORT = 0;
 
 // ---- Rings: one entry per ring, each triggered by one channel + note ----
-enum RingStyle { FLASH, SPIN };
+enum RingStyle { FLASH, SPIN, CHASE };
+
+// Shared look for the drum-pad rings (all use these, so they blink the same).
+// CHASE = several short bright arcs whipping round the ring, fading fast.
+#define   PAD_STYLE   CHASE
+#define   PAD_DECAY   220      // ms to fade out
+const int   CHASE_ARMS          = 3;      // bright arcs around the ring
+const float CHASE_TURNS_PER_SEC = 4.0f;   // rotation speed
+const float CHASE_ARC           = 0.25f;  // arc length as a fraction of one arm
+
+// Holding, sustain and aftertouch (rings and strip flashes)
+const bool  HOLD_WHILE_HELD   = true;   // rings stay lit and keep animating until note-off
+const uint8_t SUSTAIN_CC      = 64;     // sustain pedal: defers note-offs until released
+const bool  AFTERTOUCH_ON     = true;   // poly + channel pressure shape held notes
+const float AT_MIN_LEVEL      = 0.25f;  // brightness at the lightest pressure
+const float AT_SPEED_BOOST    = 1.5f;   // chase/spin speed multiplier added at full pressure
 
 struct RingConfig {
   int       port;       // which port it's on
@@ -74,17 +97,29 @@ struct RingConfig {
 };
 
 RingConfig RINGS[] = {
-  // port first count  ch  note  hue    sat   decay  style
-  {  1,   0,    24,    10, 36,   0.05f, 1.0f, 350,   FLASH },  // kick
-  {  2,   0,    24,    10, 38,   0.00f, 0.1f, 250,   SPIN  },  // snare (near-white)
-  {  3,   0,    7,     10, 42,   0.55f, 0.8f, 150,   FLASH },  // closed hi-hat
+  // port first count  ch                  note  hue    sat   decay  style
+  {  1,   0,    24,    PERCUSSIVE_CHANNEL, 36,   0.00f, 1.0f, 350,   FLASH },  // kick (single ring on A2)
+  // A1 chain: six 24-rings, two pad notes each (first red / second green)
+  {  2,   0,    24,    PERCUSSIVE_CHANNEL, 1 ,   0.97f, 1.0f, PAD_DECAY, PAD_STYLE },  // ring 1, note 1: red
+  {  2,   0,    24,    PERCUSSIVE_CHANNEL, 2 ,   0.33f, 1.0f, PAD_DECAY, PAD_STYLE },  // ring 1, note 2: green
+  {  2,   24,   24,    PERCUSSIVE_CHANNEL, 3 ,   0.97f, 1.0f, PAD_DECAY, PAD_STYLE },  // ring 2, note 3: red
+  {  2,   24,   24,    PERCUSSIVE_CHANNEL, 4 ,   0.33f, 1.0f, PAD_DECAY, PAD_STYLE },  // ring 2, note 4: green
+  {  2,   48,   24,    PERCUSSIVE_CHANNEL, 5 ,   0.97f, 1.0f, PAD_DECAY, PAD_STYLE },  // ring 3, note 5: red
+  {  2,   48,   24,    PERCUSSIVE_CHANNEL, 6 ,   0.33f, 1.0f, PAD_DECAY, PAD_STYLE },  // ring 3, note 6: green
+  {  2,   72,   24,    PERCUSSIVE_CHANNEL, 7 ,   0.97f, 1.0f, PAD_DECAY, PAD_STYLE },  // ring 4, note 7: red
+  {  2,   72,   24,    PERCUSSIVE_CHANNEL, 8 ,   0.33f, 1.0f, PAD_DECAY, PAD_STYLE },  // ring 4, note 8: green
+  {  2,   96,   24,    PERCUSSIVE_CHANNEL, 9 ,   0.97f, 1.0f, PAD_DECAY, PAD_STYLE },  // ring 5, note 9: red
+  {  2,   96,   24,    PERCUSSIVE_CHANNEL, 10,   0.33f, 1.0f, PAD_DECAY, PAD_STYLE },  // ring 5, note 10: green
+  {  2,   120,  24,    PERCUSSIVE_CHANNEL, 11,   0.97f, 1.0f, PAD_DECAY, PAD_STYLE },  // ring 6, note 11: red
+  {  2,   120,  24,    PERCUSSIVE_CHANNEL, 12,   0.33f, 1.0f, PAD_DECAY, PAD_STYLE },  // ring 6, note 12: green
+  {  3,   0,    7,     PERCUSSIVE_CHANNEL, 42,   0.55f, 0.8f, 150,   FLASH },  // closed hi-hat
 };
 const int NUM_RINGS = sizeof(RINGS) / sizeof(RINGS[0]);
 
 // ---- Power ----
 // Software current limit across ALL ports, in mA. Frames that would draw more
 // are scaled down. ~400 on USB; ~3500 for a 4A external supply.
-const int   MAX_TOTAL_MA   = 400;
+const int   MAX_TOTAL_MA   = 400;    // USB power only. Set to 4250 once the 5V 5A supply is connected.
 const float MA_PER_CHANNEL = 20.0f;     // per colour channel at full value
 const float MA_IDLE        = 1.0f;      // per pixel, chips switched on
 
@@ -107,9 +142,31 @@ const DisplayStyle DISPLAY_STYLE = DISPLAY_ALIEN;
 const bool     ALIEN_IDLE_CHATTER = true;   // glyphs murmur quietly when idle
 const unsigned long ALIEN_IDLE_MS = 4000;   // idle time before chatter starts
 
+// Alien routing: which channels write to which display, weighted.
+// weightLeft = chance a note lands on the LEFT display (the rest go right).
+// A display's brightness also follows its channels: held notes keep it lit,
+// hits flare it up, and it sinks back when everything is released.
+struct AlienRoute { uint8_t channel; float weightLeft; };
+const AlienRoute ALIEN_ROUTES[] = {
+  { DISPLAY_CHANNEL, 0.5f },   // everything on the display channel, split evenly
+};
+const bool  ALIEN_OTHER_CHANNELS = false;  // true: unlisted channels split 50/50
+const uint8_t ALIEN_MIN_BRIGHTNESS = 1;    // 0..15, resting level
+const float ALIEN_FLARE_MS = 600.0f;       // how long a hit's flare takes to fade
+
+// ALL-chord message: when DrumStrum plays a whole chord at once (several
+// strum notes arriving together on one channel), flash a message.
+const bool     ALL_MSG_ENABLED     = true;
+const uint8_t  ALL_CHORD_CHANNEL   = DISPLAY_CHANNEL;
+const int      ALL_CHORD_MIN_NOTES = 4;      // notes in one burst that count as ALL
+const unsigned long ALL_CHORD_WINDOW_MS = 8; // max spread of the burst
+const char*    ALL_MSG_LEFT        = "FUCK";
+const char*    ALL_MSG_RIGHT       = " DJT";
+const unsigned long ALL_MSG_MS     = 1500;   // how long it stays up
+
 // =====================================================================
 
-const int MAX_PORT_PIXELS = 64;   // buffer size per port
+const int MAX_PORT_PIXELS = 192;  // buffer size per port (e.g. eight 24-rings chained)
 
 Adafruit_NeoPixel* ports[NUM_PORTS];
 float rBuf[NUM_PORTS][MAX_PORT_PIXELS];
@@ -128,7 +185,7 @@ const int   IDLE_TIMEOUT   = 100;
 const float COMET_TAIL     = 0.4f;   // fraction of the strip length
 const unsigned long FRAME_MS = 8;    // ~120 fps cap leaves time for MIDI
 
-const float HUE_CC21_CENTER = 0.05f;
+const float HUE_CC21_CENTER = 0.00f;
 const float HUE_CC22_CENTER = 0.55f;
 const float HUE_CC3_CENTER  = 0.80f;
 const float HUE_RANGE       = 0.15f;
@@ -145,8 +202,8 @@ const float POS_STRUM_HI  = 0.90f;
 const int   STRUM_LOW_NOTE = 36;
 const int   STRUM_SPAN     = 48;    // 4 octaves
 
-const int STRUM_CHANNEL = 3;
-const int DRUM_CHANNEL  = 10;
+const int STRUM_CHANNEL = STRIP_CHANNEL;        // pitched flashes
+const int DRUM_CHANNEL  = PERCUSSIVE_CHANNEL;   // strip kick/snare
 const int NOTE_KICK     = 36;
 const int NOTE_SNARE    = 38;
 
@@ -183,6 +240,8 @@ struct NoteFlash {
   uint8_t note;
   bool    active;
   bool    holding;
+  bool    sustained;  // note released while the sustain pedal was down
+  float   baseLevel;  // brightness from velocity, for aftertouch to work from
 };
 
 const int MAX_FLASHES = 12;
@@ -191,8 +250,14 @@ NoteFlash flashes[MAX_FLASHES];
 struct RingState {
   float brightness;   // 0..1, decays after a hit
   float angle;        // 0..1, for SPIN
+  float baseLevel;    // brightness from velocity
+  float pressure;     // 0..1 aftertouch, or -1 if none received
+  bool  held;         // note still down (or sustained)
+  bool  sustained;    // released while the sustain pedal was down
 };
 RingState ringState[NUM_RINGS];
+
+bool sustainDown[17];   // per MIDI channel 1..16
 
 unsigned long lastMidiMs = 0;   // for the status pixel
 
@@ -244,56 +309,161 @@ uint16_t alienGlyph(uint32_t seed) {
   }
 }
 
-uint16_t alienLine[8];          // what's on the two displays, left to right
-uint16_t alienQueue[8];         // glyphs waiting to scroll in
-int      alienQueued = 0;
+// Two independent lines, one per display (index 0 = left, 1 = right).
+uint16_t alienLine[2][4];
+uint16_t alienQueue[2][8];
+int      alienQueued[2] = { 0, 0 };
+float    alienEnergy[2] = { 0, 0 };   // 0..1, drives brightness
+uint8_t  heldCount[17];               // held notes per MIDI channel (1..16)
 unsigned long lastAlienInput = 0;
 
+int alienDisplays() { return (hasLeft ? 1 : 0) + (hasRight ? 1 : 0); }
+
+// Returns the route weight for a channel, or -1 if the channel isn't shown.
+float alienWeight(uint8_t channel) {
+  for (const AlienRoute &r : ALIEN_ROUTES) if (r.channel == channel) return r.weightLeft;
+  return ALIEN_OTHER_CHANNELS ? 0.5f : -1.0f;
+}
+
+void alienNoteOn(uint8_t channel, uint8_t note, uint8_t velocity) {
+  float wl = alienWeight(channel);
+  if (wl < 0) return;
+  if (channel <= 16 && heldCount[channel] < 255) heldCount[channel]++;
+
+  int side;
+  if (alienDisplays() < 2) side = 0;   // single display: everything on line 0
+  else side = ((hash32(micros() ^ (note << 8)) & 0xFFFF) / 65536.0f) < wl ? 0 : 1;
+
+  if (alienQueued[side] < 8) alienQueue[side][alienQueued[side]++] = alienGlyph(channel * 128u + note);
+  alienEnergy[side] = max(alienEnergy[side], 0.5f + 0.5f * velocity / 127.0f);
+  lastAlienInput = millis();
+}
+
+void alienNoteOff(uint8_t channel) {
+  if (alienWeight(channel) < 0) return;
+  if (channel <= 16 && heldCount[channel] > 0) heldCount[channel]--;
+}
+
+// ---- ALL-chord message ----
+void writeText(Adafruit_AlphaNum4 &d, const char *t);
+unsigned long allMsgUntil = 0;
+bool allMsgShown = false;
+bool displaysNeedRedraw = false;
+
+void detectAllChord(uint8_t channel) {
+  static unsigned long burstStart = 0;
+  static int burstCount = 0;
+  if (!ALL_MSG_ENABLED || channel != ALL_CHORD_CHANNEL) return;
+  unsigned long now = millis();
+  if (now - burstStart > ALL_CHORD_WINDOW_MS) { burstStart = now; burstCount = 0; }
+  if (++burstCount == ALL_CHORD_MIN_NOTES) {   // fires once per burst
+    allMsgUntil = now + ALL_MSG_MS;
+    allMsgShown = false;
+  }
+}
+
+// Returns true while the message owns the displays.
+bool updateAllMsg(unsigned long now) {
+  if (allMsgUntil == 0) return false;
+  if ((long)(now - allMsgUntil) >= 0) {        // message over: hand displays back
+    allMsgUntil = 0;
+    displaysNeedRedraw = true;
+    return false;
+  }
+  if (hasLeft && hasRight) {
+    if (!allMsgShown) {
+      dispLeft.setBrightness(15);  dispRight.setBrightness(15);
+      writeText(dispLeft, ALL_MSG_LEFT);
+      writeText(dispRight, ALL_MSG_RIGHT);
+      allMsgShown = true;
+    }
+  } else {
+    // one display: first half shows the left word, second half the right word
+    static int phase = -1;
+    int p = (allMsgUntil - now) > ALL_MSG_MS / 2 ? 0 : 1;
+    if (!allMsgShown) phase = -1;
+    if (p != phase) {
+      Adafruit_AlphaNum4 &d = hasLeft ? dispLeft : dispRight;
+      d.setBrightness(15);
+      writeText(d, p == 0 ? ALL_MSG_LEFT : ALL_MSG_RIGHT);
+      phase = p;
+      allMsgShown = true;
+    }
+  }
+  return true;
+}
+
 void noteDisplay(bool isCC, uint8_t channel, uint8_t number, uint8_t value) {
+  if (!isCC && value > 0) detectAllChord(channel);
   if (DISPLAY_STYLE == DISPLAY_ALIEN) {
-    if (isCC || value == 0) return;            // notes only
-    if (alienQueued < 8) alienQueue[alienQueued++] = alienGlyph(channel * 128u + number);
-    lastAlienInput = millis();
+    if (!isCC && value > 0) alienNoteOn(channel, number, value);   // notes only
     return;
   }
   dispEvent = { true, isCC, channel, number, value };   // latest wins
 }
 
-void drawAlien() {
-  int width = (hasLeft && hasRight) ? 8 : 4;
-  int offset = 8 - width;                      // show the newest glyphs
-  Adafruit_AlphaNum4 *a = hasLeft ? &dispLeft : &dispRight;
-  for (int i = 0; i < width; i++) {
-    Adafruit_AlphaNum4 *d = (width == 8 && i >= 4) ? &dispRight : a;
-    d->writeDigitRaw(i % 4, alienLine[offset + i]);
-  }
-  if (hasLeft)  dispLeft.writeDisplay();
-  if (hasRight) dispRight.writeDisplay();
+Adafruit_AlphaNum4* alienDisp(int side) {
+  if (alienDisplays() < 2) return hasLeft ? &dispLeft : &dispRight;
+  return side == 0 ? &dispLeft : &dispRight;
+}
+
+void drawAlien(int side) {
+  Adafruit_AlphaNum4 *d = alienDisp(side);
+  for (int i = 0; i < 4; i++) d->writeDigitRaw(i, alienLine[side][i]);
+  d->writeDisplay();
 }
 
 void updateAlien(unsigned long now) {
-  static unsigned long lastDraw = 0, lastChatter = 0;
+  static unsigned long lastDraw = 0, lastChatter = 0, lastTick = 0;
+  static int lastLevel[2] = { -1, -1 };
   if (now - lastDraw < DISPLAY_MS) return;
+  if (displaysNeedRedraw) {                    // after the ALL message
+    displaysNeedRedraw = false;
+    lastLevel[0] = lastLevel[1] = -1;
+    drawAlien(0);
+    if (alienDisplays() == 2) drawAlien(1);
+  }
+  float dt = (lastTick == 0) ? 0 : (now - lastTick) / 1000.0f;
+  lastTick = now;
+  lastDraw = now;
+  int sides = alienDisplays() < 2 ? 1 : 2;
 
-  if (alienQueued > 0) {
-    // scroll everything left and append the queued glyphs
-    int n = alienQueued;
-    for (int i = 0; i < 8; i++) alienLine[i] = (i + n < 8) ? alienLine[i + n] : alienQueue[i + n - 8];
-    alienQueued = 0;
-    lastDraw = now;
-    drawAlien();
-    return;
+  for (int side = 0; side < sides; side++) {
+    // scroll queued glyphs in from the right
+    if (alienQueued[side] > 0) {
+      int n = min(alienQueued[side], 4);
+      int q = alienQueued[side];
+      for (int i = 0; i < 4; i++)
+        alienLine[side][i] = (i + n < 4) ? alienLine[side][i + n] : alienQueue[side][q - n + (i + n - 4)];
+      alienQueued[side] = 0;
+      drawAlien(side);
+    }
+
+    // brightness: flare decays, but held notes keep it up in proportion to
+    // how strongly their channel is routed to this side
+    float sustain = 0;
+    for (const AlienRoute &r : ALIEN_ROUTES) {
+      if (r.channel <= 16 && heldCount[r.channel] > 0) {
+        float w = (sides < 2) ? 1.0f : (side == 0 ? r.weightLeft : 1.0f - r.weightLeft);
+        sustain = max(sustain, 0.35f + 0.5f * w);
+      }
+    }
+    alienEnergy[side] = max(alienEnergy[side] - dt / (ALIEN_FLARE_MS / 1000.0f), sustain);
+    if (alienEnergy[side] < 0) alienEnergy[side] = 0;
+    int level = ALIEN_MIN_BRIGHTNESS +
+                (int)(alienEnergy[side] * (DISPLAY_BRIGHTNESS - ALIEN_MIN_BRIGHTNESS) + 0.5f);
+    if (level != lastLevel[side]) { alienDisp(side)->setBrightness(level); lastLevel[side] = level; }
   }
 
-  // idle chatter: now and then one glyph mutates, or the line fades a glyph out
+  // idle chatter: now and then one glyph mutates or blinks out
   if (ALIEN_IDLE_CHATTER && now - lastAlienInput > ALIEN_IDLE_MS && now - lastChatter > 700) {
     lastChatter = now;
     uint32_t r = hash32(now);
-    int pos = r % 8;
-    if ((r >> 8) % 3 == 0) alienLine[pos] = 0;
-    else                   alienLine[pos] = alienGlyph(r >> 4);
-    lastDraw = now;
-    drawAlien();
+    int side = (sides < 2) ? 0 : (r >> 20) & 1;
+    int pos = r % 4;
+    if ((r >> 8) % 3 == 0) alienLine[side][pos] = 0;
+    else                   alienLine[side][pos] = alienGlyph(r >> 4);
+    drawAlien(side);
   }
 }
 
@@ -315,7 +485,15 @@ void noteName(uint8_t n, char *out) {
 void updateDisplays(unsigned long now) {
   static unsigned long lastDraw = 0;
   if (!hasLeft && !hasRight) return;
+  if (updateAllMsg(now)) return;
   if (DISPLAY_STYLE == DISPLAY_ALIEN) { updateAlien(now); return; }
+  if (displaysNeedRedraw) {                    // text mode: restore brightness, show last event
+    displaysNeedRedraw = false;
+    if (hasLeft)  dispLeft.setBrightness(DISPLAY_BRIGHTNESS);
+    if (hasRight) dispRight.setBrightness(DISPLAY_BRIGHTNESS);
+    if (dispEvent.channel != 0) dispEvent.pending = true;
+    else { if (hasLeft) writeText(dispLeft, "    "); if (hasRight) writeText(dispRight, "    "); }
+  }
   if (!dispEvent.pending || (!hasLeft && !hasRight)) return;
   if (now - lastDraw < DISPLAY_MS) return;
   lastDraw = now;
@@ -412,10 +590,13 @@ NoteFlash* allocFlash(uint8_t channel, uint8_t note) {
 
 // ---------- MIDI handlers ----------
 void onNoteOff(byte channel, byte note, byte velocity);
+void setSustain(uint8_t channel, bool down);
 
 void onControlChange(byte channel, byte cc, byte value) {
   lastMidiMs = millis();
   noteDisplay(true, channel, cc, value);
+  if (cc == SUSTAIN_CC && channel <= 16) { setSustain(channel, value >= 64); return; }
+  if (channel != STRIP_CHANNEL) return;          // comets listen on the strip channel only
   for (int i = 0; i < NUM_CHANNELS; i++) {
     if (channels[i].cc == cc) {
       float norm = value / 127.0f;
@@ -429,12 +610,63 @@ void onControlChange(byte channel, byte cc, byte value) {
   }
 }
 
+// Sustain pedal: while down, note-offs only mark notes as sustained; on
+// release, everything sustained on that channel lets go.
+void setSustain(uint8_t channel, bool down) {
+  sustainDown[channel] = down;
+  if (down) return;
+  for (int i = 0; i < NUM_RINGS; i++)
+    if (RINGS[i].channel == channel && ringState[i].sustained) {
+      ringState[i].sustained = false;
+      ringState[i].held = false;
+    }
+  for (int i = 0; i < MAX_FLASHES; i++)
+    if (flashes[i].active && flashes[i].channel == channel && flashes[i].sustained) {
+      flashes[i].sustained = false;
+      flashes[i].holding = false;
+    }
+}
+
+float pressureLevel(float base, float pressure) {
+  return (pressure < 0) ? base : AT_MIN_LEVEL + (1.0f - AT_MIN_LEVEL) * pressure;
+}
+
+// Poly aftertouch: pressure for one held note.
+void onAfterTouchPoly(byte channel, byte note, byte pressure) {
+  lastMidiMs = millis();
+  if (!AFTERTOUCH_ON) return;
+  float p = pressure / 127.0f;
+  for (int i = 0; i < NUM_RINGS; i++)
+    if (RINGS[i].channel == channel && RINGS[i].note == note && ringState[i].held)
+      ringState[i].pressure = p;
+  for (int i = 0; i < MAX_FLASHES; i++)
+    if (flashes[i].active && flashes[i].holding && flashes[i].channel == channel && flashes[i].note == note)
+      flashes[i].brightness = pressureLevel(flashes[i].baseLevel, p);
+}
+
+// Channel pressure: applies to every held note on the channel.
+void onAfterTouchChannel(byte channel, byte pressure) {
+  lastMidiMs = millis();
+  if (!AFTERTOUCH_ON) return;
+  float p = pressure / 127.0f;
+  for (int i = 0; i < NUM_RINGS; i++)
+    if (RINGS[i].channel == channel && ringState[i].held)
+      ringState[i].pressure = p;
+  for (int i = 0; i < MAX_FLASHES; i++)
+    if (flashes[i].active && flashes[i].holding && flashes[i].channel == channel)
+      flashes[i].brightness = pressureLevel(flashes[i].baseLevel, p);
+}
+
 void triggerRings(byte channel, byte note, byte velocity) {
   float norm = velocity / 127.0f;
   for (int i = 0; i < NUM_RINGS; i++) {
     if (RINGS[i].channel == channel && RINGS[i].note == note) {
-      ringState[i].brightness = 0.35f + norm * 0.65f;
+      ringState[i].baseLevel  = 0.35f + norm * 0.65f;
+      ringState[i].brightness = ringState[i].baseLevel;
       ringState[i].angle      = 0;
+      ringState[i].pressure   = -1;
+      ringState[i].held       = HOLD_WHILE_HELD;
+      ringState[i].sustained  = false;
     }
   }
 }
@@ -451,7 +683,7 @@ void onNoteOn(byte channel, byte note, byte velocity) {
 
   float hue, sat, bright, decay, pos;
   if (channel == DRUM_CHANNEL && note == NOTE_KICK) {
-    hue = 0.05f; sat = 1.0f; bright = 0.5f + norm * 0.5f;
+    hue = 0.00f; sat = 1.0f; bright = 0.5f + norm * 0.5f;
     decay = 1.0f / (KICK_DECAY_MS / 1000.0f);  pos = POS_KICK;
   } else if (channel == DRUM_CHANNEL && note == NOTE_SNARE) {
     hue = 0.0f;  sat = 0.1f; bright = 0.4f + norm * 0.6f;   // near-white
@@ -471,17 +703,28 @@ void onNoteOn(byte channel, byte note, byte velocity) {
   f->decayRate = decay; f->pos = pos;
   f->channel = channel; f->note = note;
   f->holding = true; f->active = true;
+  f->sustained = false; f->baseLevel = bright;
 }
 
-// Release only the strip flash for this channel+note. Rings ignore note-off:
-// drum hits are short, so rings always fade from the moment of the hit.
+// Release the strip flash and rings for this channel+note (or mark them
+// sustained if the pedal is down). Rings fade from release.
 void onNoteOff(byte channel, byte note, byte velocity) {
   lastMidiMs = millis();
   if (SHOW_NOTE_OFFS) noteDisplay(false, channel, note, 0);
+  if (DISPLAY_STYLE == DISPLAY_ALIEN) alienNoteOff(channel);
+  bool sus = (channel <= 16) && sustainDown[channel];
   for (int i = 0; i < MAX_FLASHES; i++) {
     if (flashes[i].active && flashes[i].holding &&
-        flashes[i].channel == channel && flashes[i].note == note)
-      flashes[i].holding = false;
+        flashes[i].channel == channel && flashes[i].note == note) {
+      if (sus) flashes[i].sustained = true;
+      else     flashes[i].holding = false;
+    }
+  }
+  for (int i = 0; i < NUM_RINGS; i++) {
+    if (RINGS[i].channel == channel && RINGS[i].note == note && ringState[i].held) {
+      if (sus) ringState[i].sustained = true;
+      else     ringState[i].held = false;
+    }
   }
 }
 
@@ -507,10 +750,16 @@ void updateState(unsigned long now, float dt) {
 
   for (int i = 0; i < NUM_RINGS; i++) {
     RingState &s = ringState[i];
-    if (s.brightness <= 0) continue;
-    s.brightness -= dt / (RINGS[i].decayMs / 1000.0f);
-    if (s.brightness < 0) s.brightness = 0;
-    s.angle = wrapf(s.angle + dt * 2.0f);   // SPIN: ~2 turns per second
+    if (s.held) {
+      s.brightness = pressureLevel(s.baseLevel, s.pressure);   // hold, shaped by aftertouch
+    } else {
+      if (s.brightness <= 0) continue;
+      s.brightness -= dt / (RINGS[i].decayMs / 1000.0f);
+      if (s.brightness < 0) s.brightness = 0;
+    }
+    float turns = (RINGS[i].style == CHASE) ? CHASE_TURNS_PER_SEC : 2.0f;   // SPIN: ~2 turns/s
+    if (s.held && s.pressure > 0) turns *= 1.0f + AT_SPEED_BOOST * s.pressure;
+    s.angle = wrapf(s.angle + dt * turns);
   }
 }
 
@@ -555,6 +804,11 @@ void renderRings() {
         float dist = wrapf(k / (float)rc.count - s.angle);
         float arc  = (dist < 0.35f) ? 1.0f - dist / 0.35f : 0.0f;
         v *= 0.15f + 0.85f * arc * arc;   // dim ring with a bright running arc
+      } else if (rc.style == CHASE) {
+        float dist = wrapf(k / (float)rc.count - s.angle);
+        float m    = wrapf(dist * CHASE_ARMS);          // position within one arm
+        float arc  = (m < CHASE_ARC) ? 1.0f - m / CHASE_ARC : 0.0f;
+        v *= arc * arc;                                 // dark between the arcs
       }
       addPixel(rc.port, rc.first + k, rc.hue, rc.sat, v);
     }
@@ -658,8 +912,10 @@ void setup() {
   if (hasRight) { dispRight.setBrightness(DISPLAY_BRIGHTNESS); writeText(dispRight, "LITE"); }
   if (DISPLAY_STYLE == DISPLAY_ALIEN && (hasLeft || hasRight)) {
     delay(600);
-    for (int i = 0; i < 8; i++) alienLine[i] = alienGlyph(1000 + i);   // greeting
-    drawAlien();
+    for (int side = 0; side < 2; side++)
+      for (int i = 0; i < 4; i++) alienLine[side][i] = alienGlyph(1000 + side * 4 + i);   // greeting
+    drawAlien(0);
+    if (alienDisplays() == 2) drawAlien(1);
   }
 
   usb_midi.setStringDescriptor("QT Py MIDI Lights");
@@ -669,6 +925,8 @@ void setup() {
   MIDI.setHandleControlChange(onControlChange);
   MIDI.setHandleNoteOn(onNoteOn);
   MIDI.setHandleNoteOff(onNoteOff);
+  MIDI.setHandleAfterTouchPoly(onAfterTouchPoly);
+  MIDI.setHandleAfterTouchChannel(onAfterTouchChannel);
 
   // Re-enumerate so the MIDI interface shows up if the core started USB already.
   if (TinyUSBDevice.mounted()) {
